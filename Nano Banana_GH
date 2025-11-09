@@ -1,0 +1,417 @@
+// Grasshopper Script Instance
+
+#region Usings
+using System;
+using System.Linq;
+using System.Collections;
+using System.Collections.Generic;
+using System.IO;
+using System.Net;
+using System.Text;
+using System.Drawing;
+
+using Rhino;
+using Rhino.Geometry;
+
+using Grasshopper;
+using Grasshopper.Kernel;
+using Grasshopper.Kernel.Data;
+using Grasshopper.Kernel.Types;
+#endregion
+
+public class Script_Instance : GH_ScriptInstance
+{
+    #region Notes
+    /* 
+      Members:
+        RhinoDoc RhinoDocument
+        GH_Document GrasshopperDocument
+        IGH_Component Component
+        int Iteration
+
+      Methods (Virtual & overridable):
+        Print(string text)
+        Print(string format, params object[] args)
+        Reflect(object obj)
+        Reflect(object obj, string method_name)
+    */
+    #endregion
+
+    private void RunScript(bool enable, string imagePath, string prompt, string apiKey, string outputPath, ref object result)
+    {
+        // Only execute when enabled
+        if (!enable)
+        {
+            result = null;
+            return;
+        }
+        
+        const string API_BASE_URL = "https://generativelanguage.googleapis.com/v1beta";
+        const string DEFAULT_MODEL = "gemini-2.5-flash-image";
+        
+        // Validate inputs
+        if (string.IsNullOrWhiteSpace(prompt))
+        {
+            Print("Error: Prompt is required");
+            result = null;
+            return;
+        }
+        
+        if (string.IsNullOrWhiteSpace(apiKey))
+        {
+            Print("Error: API key is required");
+            result = null;
+            return;
+        }
+        
+        // Set default output path if not provided
+        if (string.IsNullOrWhiteSpace(outputPath))
+        {
+            outputPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "nano_banana_output.png");
+        }
+        else
+        {
+            // If outputPath is a directory (no extension), add filename
+            outputPath = outputPath.Trim();
+            if (Directory.Exists(outputPath) || (!File.Exists(outputPath) && !outputPath.Contains(".")))
+            {
+                // It's a directory or path without extension, add filename
+                outputPath = Path.Combine(outputPath, "nano_banana_output.png");
+            }
+            // Ensure it has .png extension if no extension specified
+            else if (!Path.HasExtension(outputPath))
+            {
+                outputPath = outputPath + ".png";
+            }
+        }
+        
+        Print($"Output path: {outputPath}");
+        
+        try
+        {
+            Print("Generating image... Please wait...");
+            // Generate image (synchronous call to avoid UI blocking)
+            string resultPath = GenerateImage(imagePath, prompt, apiKey, outputPath, API_BASE_URL, DEFAULT_MODEL);
+            result = resultPath;
+            Print($"Image generated successfully: {resultPath}");
+            
+            // Verify file was created
+            if (File.Exists(resultPath))
+            {
+                FileInfo fileInfo = new FileInfo(resultPath);
+                Print($"File size: {fileInfo.Length} bytes");
+            }
+            else
+            {
+                Print($"WARNING: File not found at: {resultPath}");
+            }
+        }
+        catch (WebException ex)
+        {
+            HttpWebResponse response = ex.Response as HttpWebResponse;
+            if (response != null)
+            {
+                if (response.StatusCode == HttpStatusCode.TooManyRequests)
+                {
+                    Print("Error: Rate limit exceeded (429 Too Many Requests)");
+                    Print("Please wait 1-2 minutes before trying again.");
+                    Print("Google API has rate limits - you may have made too many requests too quickly.");
+                    Print("Tip: Wait at least 30-60 seconds between requests to avoid rate limits.");
+                    Print("Check your API quota at: https://makersuite.google.com/app/apikey");
+                }
+                else if (response.StatusCode == HttpStatusCode.Unauthorized)
+                {
+                    Print("Error: Unauthorized (401) - Check your API key");
+                }
+                else if (response.StatusCode == HttpStatusCode.BadRequest)
+                {
+                    Print($"Error: Bad Request (400) - {ex.Message}");
+                }
+                else
+                {
+                    Print($"Error: HTTP {(int)response.StatusCode} - {ex.Message}");
+                }
+            }
+            else
+            {
+                Print($"Error: {ex.Message}");
+            }
+            result = null;
+        }
+        catch (Exception ex)
+        {
+            Print($"Error: {ex.Message}");
+            result = null;
+        }
+    }
+
+    private string GenerateImage(string imagePath, string prompt, string apiKey, string outputPath, string apiBaseUrl, string model)
+    {
+        // Build API URL
+        string apiUrl = $"{apiBaseUrl}/models/{model}:generateContent?key={apiKey}";
+        
+        // Build JSON payload manually (no external JSON library needed)
+        StringBuilder jsonBuilder = new StringBuilder();
+        jsonBuilder.Append("{");
+        jsonBuilder.Append("\"contents\":[{");
+        jsonBuilder.Append("\"role\":\"user\",");
+        jsonBuilder.Append("\"parts\":[");
+        jsonBuilder.Append("{\"text\":\"" + EscapeJsonString(prompt) + "\"}");
+        
+        // Add image if provided
+        if (!string.IsNullOrWhiteSpace(imagePath) && File.Exists(imagePath))
+        {
+            // Encode image to base64
+            byte[] inputImageBytes = File.ReadAllBytes(imagePath);
+            string base64Image = Convert.ToBase64String(inputImageBytes);
+            
+            // Determine MIME type from file extension
+            string mimeType = GetMimeType(imagePath);
+            
+            jsonBuilder.Append(",{\"inline_data\":{");
+            jsonBuilder.Append("\"mime_type\":\"" + mimeType + "\",");
+            jsonBuilder.Append("\"data\":\"" + base64Image + "\"");
+            jsonBuilder.Append("}}");
+        }
+        
+        jsonBuilder.Append("]");
+        jsonBuilder.Append("}],");
+        jsonBuilder.Append("\"generationConfig\":{");
+        jsonBuilder.Append("\"responseModalities\":[\"IMAGE\"]");
+        jsonBuilder.Append("}");
+        jsonBuilder.Append("}");
+        
+        string jsonPayload = jsonBuilder.ToString();
+        
+        // Retry logic for rate limiting
+        int maxRetries = 3;
+        int retryDelay = 5000; // Start with 5 seconds (more conservative)
+        
+        for (int attempt = 0; attempt < maxRetries; attempt++)
+        {
+            try
+            {
+                // Use HttpWebRequest for fully synchronous HTTP calls
+                HttpWebRequest request = (HttpWebRequest)WebRequest.Create(apiUrl);
+                request.Method = "POST";
+                request.ContentType = "application/json";
+                request.Timeout = 120000; // 2 minutes timeout
+                request.ReadWriteTimeout = 120000;
+                
+                // Write request body
+                byte[] requestBytes = Encoding.UTF8.GetBytes(jsonPayload);
+                request.ContentLength = requestBytes.Length;
+                
+                using (Stream requestStream = request.GetRequestStream())
+                {
+                    requestStream.Write(requestBytes, 0, requestBytes.Length);
+                }
+                
+                // Get response (synchronous)
+                HttpWebResponse response = (HttpWebResponse)request.GetResponse();
+                
+                string responseBody;
+                using (StreamReader reader = new StreamReader(response.GetResponseStream()))
+                {
+                    responseBody = reader.ReadToEnd();
+                }
+        
+                // Parse JSON response manually
+                string imageData = ExtractImageFromResponse(responseBody);
+                
+                if (string.IsNullOrEmpty(imageData))
+                {
+                    throw new Exception("No image found in API response");
+                }
+                
+                // Decode base64 to bytes
+                byte[] imageBytes = Convert.FromBase64String(imageData);
+                
+                // Ensure output directory exists
+                string outputDir = Path.GetDirectoryName(outputPath);
+                if (!string.IsNullOrEmpty(outputDir) && !Directory.Exists(outputDir))
+                {
+                    try
+                    {
+                        Directory.CreateDirectory(outputDir);
+                        Print($"Created directory: {outputDir}");
+                    }
+                    catch (Exception dirEx)
+                    {
+                        throw new Exception($"Failed to create output directory: {dirEx.Message}");
+                    }
+                }
+                
+                // Save image
+                try
+                {
+                    // Normalize path for Mac/Windows compatibility
+                    outputPath = Path.GetFullPath(outputPath);
+                    Print($"Saving to absolute path: {outputPath}");
+                    
+                    File.WriteAllBytes(outputPath, imageBytes);
+                    Print($"Image saved to: {outputPath}");
+                    
+                    // Verify file was written
+                    if (File.Exists(outputPath))
+                    {
+                        FileInfo fileInfo = new FileInfo(outputPath);
+                        Print($"✓ File verified: {fileInfo.Length} bytes");
+                        Print($"✓ Full path: {fileInfo.FullName}");
+                        Print($"✓ Directory: {fileInfo.DirectoryName}");
+                    }
+                    else
+                    {
+                        Print($"✗ ERROR: File not found after saving!");
+                        Print($"✗ Expected path: {outputPath}");
+                        Print($"✗ Current directory: {Directory.GetCurrentDirectory()}");
+                        
+                        // Try to find the file
+                        string fileName = Path.GetFileName(outputPath);
+                        string[] possibleLocations = {
+                            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                            Environment.GetFolderPath(Environment.SpecialFolder.Desktop),
+                            Directory.GetCurrentDirectory()
+                        };
+                        
+                        foreach (string location in possibleLocations)
+                        {
+                            string testPath = Path.Combine(location, fileName);
+                            if (File.Exists(testPath))
+                            {
+                                Print($"Found file at: {testPath}");
+                            }
+                        }
+                        
+                        throw new Exception($"File was not created at: {outputPath}");
+                    }
+                }
+                catch (UnauthorizedAccessException authEx)
+                {
+                    throw new Exception($"Permission denied: {authEx.Message}. Check folder permissions for: {outputPath}");
+                }
+                catch (DirectoryNotFoundException dirEx)
+                {
+                    throw new Exception($"Directory not found: {dirEx.Message}. Path: {outputPath}");
+                }
+                catch (Exception saveEx)
+                {
+                    throw new Exception($"Failed to save image: {saveEx.Message}. Path: {outputPath}");
+                }
+                
+                return outputPath;
+            }
+            catch (WebException ex)
+            {
+                HttpWebResponse errorResponse = ex.Response as HttpWebResponse;
+                if (errorResponse != null && errorResponse.StatusCode == HttpStatusCode.TooManyRequests)
+                {
+                    if (attempt < maxRetries - 1)
+                    {
+                        Print($"Rate limit hit. Waiting {retryDelay / 1000} seconds before retry {attempt + 2}/{maxRetries}...");
+                        Print("This is normal - Google API has rate limits. Please be patient.");
+                        System.Threading.Thread.Sleep(retryDelay);
+                        retryDelay *= 2; // Exponential backoff: 5s, 10s, 20s
+                    }
+                    else
+                    {
+                        // Last attempt failed
+                        Print("All retry attempts exhausted. Please wait 1-2 minutes before trying again.");
+                        throw;
+                    }
+                }
+                else
+                {
+                    // Other errors - don't retry
+                    throw;
+                }
+            }
+        }
+        
+        // Should never reach here, but just in case
+        throw new Exception("Failed after all retry attempts");
+    }
+
+    private string GetMimeType(string filePath)
+    {
+        string extension = Path.GetExtension(filePath).ToLower();
+        switch (extension)
+        {
+            case ".jpg":
+            case ".jpeg":
+                return "image/jpeg";
+            case ".png":
+                return "image/png";
+            case ".gif":
+                return "image/gif";
+            case ".webp":
+                return "image/webp";
+            default:
+                return "image/png"; // Default to PNG
+        }
+    }
+
+    private string EscapeJsonString(string str)
+    {
+        if (string.IsNullOrEmpty(str))
+            return string.Empty;
+        
+        return str.Replace("\\", "\\\\")
+                  .Replace("\"", "\\\"")
+                  .Replace("\n", "\\n")
+                  .Replace("\r", "\\r")
+                  .Replace("\t", "\\t");
+    }
+
+    private string ExtractImageFromResponse(string jsonResponse)
+    {
+        // Simple JSON parsing to extract image data
+        // Look for "inlineData":{"data":"..."}
+        int dataIndex = jsonResponse.IndexOf("\"inlineData\"");
+        if (dataIndex == -1)
+        {
+            dataIndex = jsonResponse.IndexOf("\"inline_data\"");
+        }
+        
+        if (dataIndex == -1)
+            return null;
+        
+        // Find the data field
+        int dataFieldIndex = jsonResponse.IndexOf("\"data\"", dataIndex);
+        if (dataFieldIndex == -1)
+            return null;
+        
+        // Find the value (after the colon)
+        int valueStart = jsonResponse.IndexOf("\"", dataFieldIndex + 6) + 1;
+        if (valueStart == 0)
+            return null;
+        
+        // Find the end of the value (closing quote)
+        int valueEnd = valueStart;
+        while (valueEnd < jsonResponse.Length && jsonResponse[valueEnd] != '"')
+        {
+            // Skip escaped quotes
+            if (jsonResponse[valueEnd] == '\\' && valueEnd + 1 < jsonResponse.Length)
+            {
+                valueEnd += 2;
+            }
+            else
+            {
+                valueEnd++;
+            }
+        }
+        
+        if (valueEnd >= jsonResponse.Length)
+            return null;
+        
+        string imageData = jsonResponse.Substring(valueStart, valueEnd - valueStart);
+        // Unescape JSON string
+        imageData = imageData.Replace("\\\"", "\"")
+                             .Replace("\\\\", "\\")
+                             .Replace("\\n", "\n")
+                             .Replace("\\r", "\r")
+                             .Replace("\\t", "\t");
+        
+        return imageData;
+    }
+}
